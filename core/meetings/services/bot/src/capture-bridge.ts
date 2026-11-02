@@ -563,6 +563,22 @@ export interface BrowserSession {
 }
 
 /**
+ * The Chromium flags the join browser launches with. getAuthenticatedBrowserArgs() is the minimal
+ * clean set remote-browser uses for signed-in joins; getJoinBrowserArgs() adds the fake-device /
+ * autoplay flags the join lane needs, and the join args win on conflict (later wins in Chromium arg
+ * parsing). An authenticated join drops the join lane's `--incognito`: an incognito context ignores
+ * the profile just restored from S3, so the bot reached the lobby signed out and failed
+ * `auth_session_missing` (#1725). Guest joins keep it.
+ */
+export function joinBrowserLaunchArgs(authenticated: boolean): string[] {
+  const joinArgs = getJoinBrowserArgs();
+  return [
+    ...getAuthenticatedBrowserArgs(),
+    ...(authenticated ? joinArgs.filter((arg) => arg !== '--incognito') : joinArgs),
+  ];
+}
+
+/**
  * Launch the browser the bot joins through. Authenticated bots restore the persistent profile
  * from S3 first (so they join as a signed-in user); guest bots launch a fresh persistent context.
  * Always uses getJoinBrowserArgs() (the join lane's canonical flag set) merged with the
@@ -589,10 +605,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
     cleanStaleLocks(dataDir);
   }
 
-  // getAuthenticatedBrowserArgs() is the minimal clean set remote-browser uses for signed-in
-  // joins; getJoinBrowserArgs() adds the fake-device / autoplay flags the join lane needs. The
-  // join args win on conflict (later wins in Chromium arg parsing).
-  const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
+  const args = joinBrowserLaunchArgs(!!inv.authenticated);
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
