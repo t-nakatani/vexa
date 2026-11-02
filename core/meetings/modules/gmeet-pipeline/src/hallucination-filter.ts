@@ -54,9 +54,12 @@ export function isHallucination(text: string): boolean {
   if (stripped !== lower && db.has(stripped + '...')) return true;
   if (stripped !== lower && db.has(stripped + '.')) return true;
 
-  // Too short (single word < 10 chars)
+  // Too short (single word < 10 chars). Japanese and Chinese put no spaces between words, so a whole
+  // short sentence ("カメラマンは2人。", 9 chars) reads as one word; with kana or CJK ideographs only
+  // fragments under 4 chars count as too short.
   const words = trimmed.split(/\s+/);
-  if (words.length <= 1 && trimmed.length < 10) return true;
+  const minChars = /[぀-ヿ㐀-鿿]/.test(trimmed) ? 4 : 10;
+  if (words.length <= 1 && trimmed.length < minChars) return true;
 
   // Repetition loop: same 3-6 word phrase repeated 3+ times
   if (words.length >= 9) {

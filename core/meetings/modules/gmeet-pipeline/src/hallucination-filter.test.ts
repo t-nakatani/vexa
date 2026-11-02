@@ -22,6 +22,11 @@ check("short single word → dropped", isHallucination("ok") === true);
 check("long single word kept", isHallucination("internationalization") === false);
 check("clean sentence kept", isHallucination("the quick brown fox jumps over") === false);
 check("repetition loop (3+ ×) → dropped", isHallucination("i love it i love it i love it i love it") === true);
+// Unspaced scripts: a short Japanese sentence is one "word" but real speech; only a fragment is junk.
+check('ja: short sentence kept ("カメラマンは2人。")', isHallucination("カメラマンは2人。") === false);
+check('zh: short sentence kept ("我们明天开会。")', isHallucination("我们明天开会。") === false);
+check('ja: fragment under 4 chars → dropped ("はい。")', isHallucination("はい。") === true);
+check("latin short word still dropped (no CJK)", isHallucination("thanks") === true);
 
 // Phrase-list path: a phrase actually in en.txt must be filtered (loaded the same way the brick loads).
 const enPhrases = readFileSync(resolve(here, "hallucinations", "en.txt"), "utf-8")
