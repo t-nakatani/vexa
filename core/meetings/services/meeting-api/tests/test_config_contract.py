@@ -474,3 +474,36 @@ def test_probe_declares_a_long_ttl_because_the_round_trip_is_metered():
     assert float(probe.get("ttl_s") or 0) >= 600, (
         "the audio probe COSTS a fraction of a minute per run — /health must not re-bill it "
         "every 60s")
+
+
+def test_probe_names_its_user_agent_so_edge_protection_does_not_refuse_it():
+    """urllib's default ``Python-urllib/x.y`` agent is refused at the edge by common protection
+    (Cloudflare answers 403 "error code: 1010" before the endpoint runs). The probe would read that
+    403 as a rejected token and block every spawn of a working endpoint — so it sends its own name."""
+    agents: list = []
+
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            agents.append(self.headers.get("User-Agent"))
+            self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        env = {"TRANSCRIPTION_SERVICE_URL": f"http://127.0.0.1:{server.server_address[1]}",
+               "TRANSCRIPTION_SERVICE_TOKEN": "t"}
+        cp._http_probe(_stt_probe_spec()["http"], env, timeout=10)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert agents == ["vexa-config-preflight"], agents

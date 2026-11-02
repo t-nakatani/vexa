@@ -231,6 +231,10 @@ def _http_probe(spec: dict, env: Mapping[str, str], timeout: float) -> dict:
     if (spec.get("payload") or "") == "audio":
         content_type, body = audio_probe_body(spec.get("payload_model") or "whisper-1")
     req = urllib.request.Request(url, data=body, method=(spec.get("method") or "POST"))
+    # urllib's default ``Python-urllib/x.y`` agent is refused AT THE EDGE by common protection
+    # (Cloudflare answers 403 "error code: 1010" before the endpoint runs). The oracle above would
+    # read that 403 as a rejected token and block every spawn of a working endpoint, so name it.
+    req.add_header("User-Agent", "vexa-config-preflight")
     if content_type:
         req.add_header("Content-Type", content_type)
     token = (env.get(spec["auth_key"]) or "").strip() if spec.get("auth_key") else ""
