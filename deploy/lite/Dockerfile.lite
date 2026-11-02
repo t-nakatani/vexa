@@ -101,9 +101,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       supervisor postgresql-client \
       xvfb fluxbox x11vnc novnc python3-websockify \
       pulseaudio xdotool xclip socat ffmpeg libsndfile1 \
-      curl git ca-certificates \
+      curl git ca-certificates unzip \
  && usermod -aG pulse-access root 2>/dev/null || true \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# aws CLI — the authenticated-bot session store (@vexa/remote-browser session-store.ts) shells out to
+# `aws s3` to restore the signed-in profile before launch and to write it back; without the binary
+# every authenticated spawn fails at session-restore. Same installer as the bot image (noble has no
+# `awscli` package, #1011).
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
+ && unzip -q /tmp/awscliv2.zip -d /tmp \
+ && /tmp/aws/install \
+ && rm -rf /tmp/aws /tmp/awscliv2.zip \
+ && aws --version
 
 # Valkey 8.1.9 (BSD-3) — the internal cache/stream store, glibc-matched from valkey-builder. Ships
 # valkey-server + valkey-cli on PATH (supervisord runs valkey-server; healthchecks use valkey-cli),
