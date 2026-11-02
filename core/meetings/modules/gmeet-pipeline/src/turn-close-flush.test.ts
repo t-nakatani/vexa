@@ -9,7 +9,8 @@
  *
  * With `callbackStampedFrames`, the close emits `lastTranscript` only when it covers every buffered
  * sample; otherwise it submits the whole window as the final one (or, with a request in flight,
- * resubmits it when that response lands). Feeders without the flag keep today's flush.
+ * resubmits it when that response lands). `finalizeUncoveredTurnTail` gives a gapless feeder (Google
+ * Meet) the same close. Feeders with neither flag keep today's flush.
  *
  * Model-free and timer-free: requests are issued through the manager's own submit path, answered
  * by hand, and the consumer is modelled as an upsert-by-id store.
@@ -31,7 +32,7 @@ const SR = 16000, FRAME = 4096, FRAME_MS = (FRAME / SR) * 1000;
 const speech = (): Float32Array => { const f = new Float32Array(FRAME); for (let i = 0; i < FRAME; i++) f[i] = 0.1 * Math.sin(i / 7); return f; };
 const one = (text: string, end: number) => [{ start: 0, end, text }];
 
-function harness(config?: { callbackStampedFrames?: boolean }) {
+function harness(config?: { callbackStampedFrames?: boolean; finalizeUncoveredTurnTail?: boolean }) {
   const mgr = new SpeakerStreamManager(config);
   const requests: number[] = [];                                   // frames per transcription request
   const store = new Map<string, { text: string; completed: boolean }>();   // consumer: upsert by id
@@ -113,6 +114,23 @@ const ZOOM = { callbackStampedFrames: true } as const;
   await h.mgr.flushSpeaker(SID, true);
   ok(h.requests.length === 1 && h.confirmed()[0] === 'early words',
     'without the flag the close emits the last transcript as before (unchanged default path)');
+  h.mgr.removeAll();
+}
+
+// ── E: finalizeUncoveredTurnTail gives a gapless feeder (Google Meet) the same close as A ─────
+{
+  const h = harness({ finalizeUncoveredTurnTail: true }); const SID = 'ch-7:1';
+  h.mgr.addSpeaker(SID, 'Speaker');
+  h.feed(SID, 8);
+  await h.submit(SID);
+  h.mgr.handleTranscriptionResult(SID, 'early words', 2.0, one('early words', 2.0), 'en');
+  h.feed(SID, 4);
+  await h.mgr.flushSpeaker(SID, true);
+  ok(h.requests.length === 2 && h.requests[1] === 12,
+    `with finalizeUncoveredTurnTail the close submits the whole 12-frame window (requests: ${JSON.stringify(h.requests)})`);
+  h.mgr.handleTranscriptionResult(SID, 'early words and later words', 3.0, one('early words and later words', 3.0), 'en');
+  ok(h.confirmed().length === 1 && h.confirmed()[0] === 'early words and later words',
+    `the turn keeps the words spoken after the last answered request (confirmed: ${JSON.stringify(h.confirmed())})`);
   h.mgr.removeAll();
 }
 

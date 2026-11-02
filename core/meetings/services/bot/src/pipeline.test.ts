@@ -375,8 +375,11 @@ async function main(): Promise<void> {
     check('zoom per-track lane config carries callbackStampedFrames (with and without env tuning)',
       perChannelLaneConfig('zoom', FAST)?.callbackStampedFrames === true && perChannelLaneConfig('zoom', FAST)?.maxBufferDuration === FAST.maxBufferDuration
         && perChannelLaneConfig('zoom')?.callbackStampedFrames === true);
-    check('google_meet lane config is passed through unchanged',
-      perChannelLaneConfig('google_meet', FAST) === FAST && perChannelLaneConfig('google_meet') === undefined);
+    check('google_meet lane config carries finalizeUncoveredTurnTail, keeps env tuning, and stays on the gapless clock',
+      perChannelLaneConfig('google_meet', FAST)?.finalizeUncoveredTurnTail === true
+        && perChannelLaneConfig('google_meet', FAST)?.maxBufferDuration === FAST.maxBufferDuration
+        && perChannelLaneConfig('google_meet')?.finalizeUncoveredTurnTail === true
+        && perChannelLaneConfig('google_meet')?.callbackStampedFrames === undefined);
   }
 
   // ── 9) ZOOM PER-TRACK turn gap: a starved page loses capture callbacks for 1–2 s inside speech.

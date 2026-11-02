@@ -491,12 +491,15 @@ export function perChannelOnsetGapMs(platform: Platform | string): number | unde
 /** The per-channel lane's tuning for one platform. Per-track capture (Zoom) stamps each frame at
  *  capture-callback time (#1774), so on a starved page consecutive frames are spaced wider than the
  *  audio they carry; the lane is told so and measures input gaps frame to frame. Google Meet keeps
- *  the configuration it is given, unchanged. */
+ *  its gapless clock but gets the same turn-close finalize (`finalizeUncoveredTurnTail`): its turns
+ *  also keep receiving audio while a request is answered, and the close must not drop that tail. */
 export function perChannelLaneConfig(
   platform: Platform | string,
   config?: SpeakerStreamManagerConfig,
 ): SpeakerStreamManagerConfig | undefined {
-  return isPerTrackLanePlatform(platform) ? { ...config, callbackStampedFrames: true } : config;
+  return isPerTrackLanePlatform(platform)
+    ? { ...config, callbackStampedFrames: true }
+    : { ...config, finalizeUncoveredTurnTail: true };
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */

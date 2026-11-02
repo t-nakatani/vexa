@@ -76,7 +76,8 @@ interface SpeakerBuffer {
   /** Buffered-sample index the latest transcription request covered up to (its window end). */
   submittedEndSample?: number;
   /** Window end of the request whose text is `lastTranscript`. Read by the turn-close flush only
-   *  with `callbackStampedFrames`: the flush emits that text only when it covers every buffered sample. */
+   *  with `callbackStampedFrames` or `finalizeUncoveredTurnTail`: the flush emits that text only when
+   *  it covers every buffered sample. */
   lastTranscriptEndSample?: number;
   /** A hard-cap request is in flight for the window ending at this buffered-sample index
    *  (`callbackStampedFrames` only); its response finalizes that window and keeps the rest. */
@@ -111,6 +112,12 @@ export interface SpeakerStreamManagerConfig {
    *  hard cap, the window up to its quietest late frame is finalized from its own request and the
    *  audio after that cut stays buffered. Opt-in; default false keeps every other feeder's behaviour. */
   callbackStampedFrames?: boolean;
+  /** A turn close emits the last transcript only when it covers every buffered sample, and otherwise
+   *  submits the whole window as the final one — the turn-close half of `callbackStampedFrames`,
+   *  without its frame-stamped clock. A Google Meet turn keeps receiving audio while a request is
+   *  answered, so the close otherwise finalized text that stopped up to one submit interval short
+   *  and the end of each sentence was never transcribed. Opt-in; default false. */
+  finalizeUncoveredTurnTail?: boolean;
 }
 
 /** Root-mean-square energy of a PCM window in [-1,1]; the near-silent oracle (#617). */
@@ -132,6 +139,7 @@ export class SpeakerStreamManager {
   private sampleRate: number;
   private silenceRmsThreshold: number;
   private callbackStampedFrames: boolean;
+  private finalizeUncoveredTurnTail: boolean;
   /** Audio carried forward from a flushed short segment — prepended to the next feedAudio call */
   private carryForward: Float32Array[] = [];
   /** Generation at time of last submission — used to detect stale responses after fullReset */
@@ -158,6 +166,7 @@ export class SpeakerStreamManager {
     this.sampleRate = config?.sampleRate ?? 16000;
     this.silenceRmsThreshold = config?.silenceRmsThreshold ?? 0.0025;
     this.callbackStampedFrames = config?.callbackStampedFrames ?? false;
+    this.finalizeUncoveredTurnTail = config?.finalizeUncoveredTurnTail ?? false;
   }
 
   addSpeaker(speakerId: string, speakerName: string): void {
@@ -903,10 +912,12 @@ export class SpeakerStreamManager {
     buffer.confirmedSamples = 0;
   }
 
-  /** Whether `lastTranscript` describes every buffered sample. Only a callback-stamped feeder asks:
-   *  every other feeder emits its last transcript at a turn close exactly as before. */
+  /** Whether `lastTranscript` describes every buffered sample. Only a callback-stamped feeder or one
+   *  with `finalizeUncoveredTurnTail` asks: every other feeder emits its last transcript at a turn
+   *  close exactly as before. */
   private lastTranscriptCoversBuffer(buffer: SpeakerBuffer): boolean {
-    if (!this.callbackStampedFrames || buffer.lastTranscriptEndSample === undefined) return true;
+    if (!(this.callbackStampedFrames || this.finalizeUncoveredTurnTail)) return true;
+    if (buffer.lastTranscriptEndSample === undefined) return true;
     return buffer.lastTranscriptEndSample >= buffer.totalSamples;
   }
 
