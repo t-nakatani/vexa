@@ -35,6 +35,7 @@ import { createBotRecordingSink } from './recording.js';
 import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
+import { cdpFrameSource, startVideoRecorder, videoCaptureConfigFromEnv } from './video-capture.js';
 import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
@@ -196,6 +197,12 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
+  // Video rides beside the audio recording as the same recording's `video` media file — only on a
+  // recording bot, only when the operator turned it on (VEXA_VIDEO_RECORDING=1), and never when the
+  // caller's capture modes leave video out.
+  const videoConfig = recording && (!inv.captureModes || inv.captureModes.includes('video'))
+    ? videoCaptureConfigFromEnv(env) : null;
+  const videoSink = videoConfig ? createBotRecordingSink({ inv, mediaType: 'video', log: (m) => console.log(`[bot] ${m}`) }) : undefined;
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
@@ -288,7 +295,25 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
       startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
-      startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
+      startRecording: rec ? async () => {                                                   // MediaRecorder → recording.v1
+        const stopAudio = await startRecording(sess.page, inv, rec);
+        let stopVideo: (() => Promise<void>) | null = null;
+        if (videoConfig && videoSink) {
+          try {
+            stopVideo = await startVideoRecorder({
+              frames: cdpFrameSource(sess.page, videoConfig), sink: videoSink, cfg: videoConfig,
+              key: `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`,
+              log: (m) => console.log(`[bot] ${m}`),
+            });
+          } catch (e) {
+            console.error(`[bot] video recording failed to start (audio continues): ${String(e)}`);
+          }
+        }
+        return async () => {
+          await stopAudio();
+          await stopVideo?.().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`));
+        };
+      } : undefined,
       engine: bp,
       onFault: (stage, e) => {
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);

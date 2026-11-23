@@ -52,13 +52,15 @@ export interface RecordingSinkOptions {
   /** Override the chunk uploader (tests inject this to assert per-chunk upload without a live
    *  receiver). Default = HTTP upload to inv.recordingUploadUrl via RecordingService.uploadChunk. */
   uploadChunk?: ChunkUploader;
+  /** Which media_files entry of the session's recording the chunks fold into (default 'audio'). */
+  mediaType?: 'audio' | 'video';
   log?: (msg: string) => void;
 }
 
 /** The default chunk uploader: POST each chunk to meeting-api's internal upload endpoint via the
  *  shipped RecordingService.uploadChunk (multipart, retry+backoff, structured chunk-loss logging).
  *  session_uid is inv.connectionId — the server resolves the eager-created MeetingSession by it. */
-function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkUploader {
+function defaultChunkUploader(inv: Invocation, mediaType: 'audio' | 'video', log: (m: string) => void): ChunkUploader {
   const url = inv.recordingUploadUrl;
   const meetingId = inv.meeting_id ?? 0;
   const sessionUid = inv.connectionId ?? '';
@@ -66,10 +68,10 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
   const svc = new RecordingService(meetingId, sessionUid);
   return async (seq, isFinal, format, bytes) => {
     if (!url) {
-      log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
+      log(`recording: no recordingUploadUrl — ${mediaType} chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
       return;
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
+    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format, mediaType);
   };
 }
 
@@ -79,7 +81,7 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
  */
 export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecordingSink {
   const log = opts.log ?? (() => { /* silent by default */ });
-  const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
+  const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, opts.mediaType ?? 'audio', log);
 
   let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
   let anyChunk = false;                                // did the tap ever deliver a chunk?
