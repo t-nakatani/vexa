@@ -91,7 +91,7 @@ const DEFAULT_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000; // 4 hours
 /** How long video uploads wait for the audio's first upload to allocate the recording (index.ts videoSink). */
 const VIDEO_FIRST_UPLOAD_WAIT_MS = 60_000;
 /** How long teardown waits for the video's queued uploads to be delivered. */
-const VIDEO_DRAIN_TIMEOUT_MS = 30_000;
+const VIDEO_DRAIN_TIMEOUT_MS = 15_000;
 function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.ProcessEnv = process.env): number {
   const al = inv.automaticLeave ?? {};
   const noOneJoined = al.noOneJoinedTimeout ?? 600_000;
@@ -200,6 +200,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
+  // Set once the video recorder has stopped: its queued uploads, awaited before the process exits.
+  let videoDrain: Promise<void> | null = null;
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
   // Video rides beside the audio recording as the same recording's `video` media file — only on a
   // recording bot, only when the operator turned it on (VEXA_VIDEO_RECORDING=1), and never when the
@@ -328,13 +330,12 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
               if (!stopVideo || !videoSink) return;
               await stopVideo().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`));
               // The encoder has ended and queued its last chunk. Nothing more will come from the audio
-              // side worth waiting for, so open the gate and deliver what the video queued before exit
+              // side worth waiting for, so open the gate and let the video deliver what it queued
               // (a bot with no audio chunk at all would otherwise lose its whole video at process exit).
+              // The drain is awaited in main's teardown, OUTSIDE the pipeline's page-stop ceiling
+              // (stopTimeoutMs), so a slow upload is not cut short at 15s.
               videoSink.release();
-              await Promise.race([
-                videoSink.drain(),
-                new Promise<void>((r) => { setTimeout(r, VIDEO_DRAIN_TIMEOUT_MS).unref?.(); }),
-              ]);
+              videoDrain = videoSink.drain();
             })(),
           ]);
         };
@@ -388,6 +389,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
     await pipeline.stop().catch(() => { /* best-effort */ });
+    // The video's queued uploads (final chunk included) — bounded so a slow store cannot ride the
+    // SIGTERM force-exit watchdog (signals.ts).
+    if (videoDrain) {
+      await Promise.race([videoDrain, new Promise<void>((r) => { setTimeout(r, VIDEO_DRAIN_TIMEOUT_MS).unref?.(); })]);
+    }
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     // The two teardown sidecars, written BEFORE the upload reads the directory. Both are
     // best-effort by construction: a diagnostic that can change how a meeting ended is worse than
