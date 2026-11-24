@@ -30,6 +30,8 @@ const DEFAULTS: VideoCaptureConfig = {
   width: 640, height: 360, fps: 2, bitrateKbps: 150, timesliceMs: 15000, jpegQuality: 60,
 };
 
+const FRAME_STOP_TIMEOUT_MS = 3000;
+
 const NUMERIC_ENV: Array<[keyof VideoCaptureConfig, string]> = [
   ['width', 'VEXA_VIDEO_WIDTH'],
   ['height', 'VEXA_VIDEO_HEIGHT'],
@@ -175,7 +177,12 @@ export async function startVideoRecorder(deps: VideoRecorderDeps): Promise<() =>
     stopped ??= (async () => {
       clearInterval(tick);
       clearInterval(slicer);
-      await frames.stop().catch(() => { /* best-effort */ });
+      // The frame source talks to the page; a page that no longer answers must not keep the encoder
+      // open, so its stop gets a short ceiling and the encoder ends regardless.
+      await Promise.race([
+        frames.stop().catch(() => { /* best-effort */ }),
+        new Promise<void>((resolve) => { setTimeout(resolve, FRAME_STOP_TIMEOUT_MS).unref?.(); }),
+      ]);
       if (encoderAlive) {
         encoder.stdin.end();
         const timer = setTimeout(() => { encoder.kill('SIGKILL'); }, 10000);

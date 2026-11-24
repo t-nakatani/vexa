@@ -62,6 +62,20 @@ async function main(): Promise<void> {
   check('non-final chunks are never empty', chunks.filter((c) => !c.isFinal).every((c) => c.bytes.length > 0));
   check('frame source stopped once', frameStops === 1, String(frameStops));
 
+  // ── a frame source whose stop never answers (page gone) does not keep the encoder open ──
+  const chunks2: Array<{ isFinal: boolean }> = [];
+  const stop2 = await startVideoRecorder({
+    frames: { async start(onFrame) { onFrame(Buffer.from('C')); }, stop: () => new Promise<void>(() => { /* never */ }) },
+    sink: { chunk: (_k, _s, isFinal) => { chunks2.push({ isFinal }); }, close: () => { /* unused */ } },
+    key: 'k2', cfg,
+    spawnEncoder: () => spawn('cat', [], { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams,
+  });
+  await sleep(100);
+  const t0 = Date.now();
+  const settled = await Promise.race([stop2().then(() => true), sleep(6000).then(() => false)]);
+  check('hung frame source: stop still settles within the ceiling', settled && Date.now() - t0 < 5000, `settled=${settled} ms=${Date.now() - t0}`);
+  check('hung frame source: the final chunk is still delivered', chunks2.filter((c) => c.isFinal).length === 1);
+
   if (failed) { console.error(`\n❌ ${failed} check(s) failed`); process.exit(1); }
   console.log('\n✅ video-capture: all checks passed');
 }

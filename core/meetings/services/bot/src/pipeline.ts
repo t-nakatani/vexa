@@ -503,7 +503,7 @@ export function perChannelLaneConfig(
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */
-export type LiveStage = 'capture-start' | 'recording-start' | 'engine-start';
+export type LiveStage = 'capture-start' | 'recording-start' | 'engine-start' | 'capture-stop' | 'recording-stop';
 
 /**
  * Serialize a thrown value for a LOG LINE (#593 A1). Prefer the stack (names the throwing frame),
@@ -529,6 +529,10 @@ export interface LivePipelineDeps {
   onFault: (stage: LiveStage, e: unknown) => void;
   /** Bounded retry for engine start (the pyannote model load). Default 3 attempts, 2s apart. */
   retry?: { attempts: number; delayMs: number };
+  /** Ceiling on each page-side teardown (capture, recording). A page that has navigated away from
+   *  the meeting can leave a page call unanswered; past this the step is reported and skipped so
+   *  the bot still leaves and emits `completed`. Default 15s. */
+  stopTimeoutMs?: number;
 }
 
 /**
@@ -551,6 +555,16 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   const { startCapture, startRecording, engine, onFault } = deps;
   const maxAttempts = Math.max(1, deps.retry?.attempts ?? 3);
   const delayMs = Math.max(0, deps.retry?.delayMs ?? 2000);
+  const stopTimeoutMs = Math.max(1, deps.stopTimeoutMs ?? 15000);
+
+  // One page-side teardown, bounded: it settles, or after stopTimeoutMs it is reported and left behind.
+  const boundedStop = async (stage: LiveStage, fn: () => Promise<void>): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), stopTimeoutMs); });
+    const outcome = await Promise.race([fn().then(() => 'done' as const, () => 'done' as const), timedOut]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout') onFault(stage, new Error(`${stage} did not settle within ${stopTimeoutMs}ms; skipped`));
+  };
 
   let stopCapture: (() => Promise<void>) | null = null;
   let stopRecording: (() => Promise<void>) | null = null;
@@ -588,9 +602,9 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       stopped = true;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       const sc = stopCapture; stopCapture = null;
-      if (sc) await sc().catch(() => { /* best-effort — page may be closing */ });
+      if (sc) await boundedStop('capture-stop', sc);       // best-effort — page may be closing
       const sr = stopRecording; stopRecording = null;
-      if (sr) await sr().catch(() => { /* best-effort — flush the final chunk → master assembly */ });
+      if (sr) await boundedStop('recording-stop', sr);     // best-effort — flush the final chunk → master assembly
       await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
     },
   };

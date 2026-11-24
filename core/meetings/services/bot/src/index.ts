@@ -309,9 +309,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
             console.error(`[bot] video recording failed to start (audio continues): ${String(e)}`);
           }
         }
+        // The two stop independently: the video's stop ends its own encoder and never waits on the
+        // page, so it finishes even when the page-side audio stop does not answer.
         return async () => {
-          await stopAudio();
-          await stopVideo?.().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`));
+          await Promise.all([
+            stopAudio(),
+            stopVideo?.().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`)),
+          ]);
         };
       } : undefined,
       engine: bp,
