@@ -35,6 +35,7 @@ import { createBotRecordingSink } from './recording.js';
 import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
 import { createSttFaultReporter } from './stt-faults.js';
+import { cdpFrameSource, startVideoRecorder, videoCaptureConfigFromEnv } from './video-capture.js';
 import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
@@ -87,6 +88,10 @@ function meetingChannelId(inv: Invocation): string | number {
  *  GENEROUS backstop (default 4h, override with BOT_MAX_ACTIVE_MS in ms). We floor it at the largest
  *  configured lifecycle timeout + 60s so it cannot undercut a more specific lifecycle verdict. */
 const DEFAULT_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000; // 4 hours
+/** How long video uploads wait for the audio's first upload to allocate the recording (index.ts videoSink). */
+const VIDEO_FIRST_UPLOAD_WAIT_MS = 60_000;
+/** How long teardown waits for the video's queued uploads to be delivered. */
+const VIDEO_DRAIN_TIMEOUT_MS = 15_000;
 function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.ProcessEnv = process.env): number {
   const al = inv.automaticLeave ?? {};
   const noOneJoined = al.noOneJoinedTimeout ?? 600_000;
@@ -195,7 +200,21 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
+  // Set once the video recorder has stopped: its queued uploads, awaited before the process exits.
+  let videoDrain: Promise<void> | null = null;
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
+  // Video rides beside the audio recording as the same recording's `video` media file — only on a
+  // recording bot, only when the operator turned it on (VEXA_VIDEO_RECORDING=1), and never when the
+  // caller's capture modes leave video out.
+  const videoConfig = recording && (!inv.captureModes || inv.captureModes.includes('video'))
+    ? videoCaptureConfigFromEnv(env) : null;
+  // The video's uploads wait for the audio's first upload, which allocates the session's recording;
+  // two first chunks racing in would split the recording across two storage prefixes. Bounded, so a
+  // bot whose audio never yields a chunk still records video (it is then the only stream).
+  const videoSink = videoConfig && recording ? createBotRecordingSink({
+    inv, mediaType: 'video', log: (m) => console.log(`[bot] ${m}`),
+    startAfter: Promise.race([recording.firstUpload, new Promise<void>((r) => { setTimeout(r, VIDEO_FIRST_UPLOAD_WAIT_MS).unref?.(); })]),
+  }) : undefined;
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
@@ -288,7 +307,39 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
       startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
-      startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
+      startRecording: rec ? async () => {                                                   // MediaRecorder → recording.v1
+        const stopAudio = await startRecording(sess.page, inv, rec);
+        let stopVideo: (() => Promise<void>) | null = null;
+        if (videoConfig && videoSink) {
+          try {
+            stopVideo = await startVideoRecorder({
+              frames: cdpFrameSource(sess.page, videoConfig), sink: videoSink, cfg: videoConfig,
+              key: `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`,
+              log: (m) => console.log(`[bot] ${m}`),
+            });
+          } catch (e) {
+            console.error(`[bot] video recording failed to start (audio continues): ${String(e)}`);
+          }
+        }
+        // The two stop independently: the video's stop ends its own encoder and never waits on the
+        // page, so it finishes even when the page-side audio stop does not answer.
+        return async () => {
+          await Promise.all([
+            stopAudio(),
+            (async () => {
+              if (!stopVideo || !videoSink) return;
+              await stopVideo().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`));
+              // The encoder has ended and queued its last chunk. Nothing more will come from the audio
+              // side worth waiting for, so open the gate and let the video deliver what it queued
+              // (a bot with no audio chunk at all would otherwise lose its whole video at process exit).
+              // The drain is awaited in main's teardown, OUTSIDE the pipeline's page-stop ceiling
+              // (stopTimeoutMs), so a slow upload is not cut short at 15s.
+              videoSink.release();
+              videoDrain = videoSink.drain();
+            })(),
+          ]);
+        };
+      } : undefined,
       engine: bp,
       onFault: (stage, e) => {
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
@@ -338,6 +389,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
     await pipeline.stop().catch(() => { /* best-effort */ });
+    // The video's queued uploads (final chunk included) — bounded so a slow store cannot ride the
+    // SIGTERM force-exit watchdog (signals.ts).
+    if (videoDrain) {
+      await Promise.race([videoDrain, new Promise<void>((r) => { setTimeout(r, VIDEO_DRAIN_TIMEOUT_MS).unref?.(); })]);
+    }
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     // The two teardown sidecars, written BEFORE the upload reads the directory. Both are
     // best-effort by construction: a diagnostic that can change how a meeting ended is worse than

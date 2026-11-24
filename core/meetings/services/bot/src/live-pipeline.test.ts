@@ -134,6 +134,24 @@ async function main(): Promise<void> {
     check('stop: no further engine attempts after stop (timer cancelled)', attempts === afterStart, `after=${afterStart} now=${attempts}`);
   }
 
+  // 6b) a page-side stop that never answers (the page navigated away from the meeting) is bounded:
+  //     stop() still settles, the engine still stops, and the stuck step is reported.
+  {
+    const faults: Array<{ stage: LiveStage; msg: string }> = [];
+    const engine = fakeEngine();
+    const live = createLivePipeline({
+      startCapture: async () => async () => { /* answers */ },
+      startRecording: async () => () => new Promise<void>(() => { /* never settles */ }),
+      engine, onFault: (stage, e) => faults.push({ stage, msg: String(e) }), stopTimeoutMs: 50,
+    });
+    await live.start();
+    const t0 = Date.now();
+    const settled = await Promise.race([live.stop().then(() => true), tick(1000).then(() => false)]);
+    check('stop: a hung recording stop does not hang stop()', settled && Date.now() - t0 < 500, `settled=${settled} ms=${Date.now() - t0}`);
+    check('stop: engine still stopped after the hung step', engine.stops === 1, `stops=${engine.stops}`);
+    check('stop: the hung step is reported as recording-stop', faults.some((f) => f.stage === 'recording-stop' && f.msg.includes('did not settle')), JSON.stringify(faults));
+  }
+
   // 7) serr: full-fidelity serialization — the A1 fix for the {isTrusted:true} fidelity loss.
   {
     const e = new Error('config.json not found');
