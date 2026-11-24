@@ -123,6 +123,43 @@ async function main(): Promise<void> {
     check('empty session: close is a no-op (no upload)', seen.length === 0, String(seen.length));
   }
 
+  // ── 6b) a gated sink (video) uploads nothing until the first sink's FIRST upload settles ──────
+  // meeting-api allocates the session's recording on the first upload; two first chunks racing in
+  // (audio + video) would split it across two storage prefixes. The video waits on audio.firstUpload.
+  {
+    const order: string[] = [];
+    let releaseAudio!: () => void;
+    const audioGate = new Promise<void>((r) => { releaseAudio = r; });
+    const audio = createBotRecordingSink({
+      inv: inv(),
+      uploadChunk: async (seq) => { order.push(`audio:${seq}:start`); await audioGate; order.push(`audio:${seq}:done`); },
+    });
+    const video = createBotRecordingSink({
+      inv: inv(), mediaType: 'video', startAfter: audio.firstUpload,
+      uploadChunk: (seq) => { order.push(`video:${seq}`); },
+    });
+    video.chunk('k', 0, false, 'webm', new Uint8Array([1]));   // the video's first chunk arrives FIRST
+    audio.chunk('k', 0, false, 'webm', new Uint8Array([2]));
+    await flush();
+    check('gate: video holds while the audio first upload is in flight', !order.some((o) => o.startsWith('video')), order.join(','));
+    releaseAudio();
+    await flush(); await flush();
+    check('gate: video uploads after the audio first upload settled',
+      order.join(',') === 'audio:0:start,audio:0:done,video:0', order.join(','));
+  }
+  {
+    // A failed first upload still releases the gate (the video must not wait forever).
+    const seen: string[] = [];
+    const audio = createBotRecordingSink({ inv: inv(), uploadChunk: () => { throw new Error('boom'); } });
+    const video = createBotRecordingSink({
+      inv: inv(), mediaType: 'video', startAfter: audio.firstUpload, uploadChunk: (seq) => { seen.push(`video:${seq}`); },
+    });
+    audio.chunk('k', 0, false, 'webm', new Uint8Array([1]));
+    video.chunk('k', 0, false, 'webm', new Uint8Array([1]));
+    await flush(); await flush();
+    check('gate: a failed audio first upload still lets the video through', seen.join(',') === 'video:0', seen.join(','));
+  }
+
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
     interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number }

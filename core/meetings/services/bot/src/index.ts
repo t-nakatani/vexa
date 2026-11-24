@@ -88,6 +88,8 @@ function meetingChannelId(inv: Invocation): string | number {
  *  GENEROUS backstop (default 4h, override with BOT_MAX_ACTIVE_MS in ms). We floor it at the largest
  *  configured lifecycle timeout + 60s so it cannot undercut a more specific lifecycle verdict. */
 const DEFAULT_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000; // 4 hours
+/** How long video uploads wait for the audio's first upload to allocate the recording (index.ts videoSink). */
+const VIDEO_FIRST_UPLOAD_WAIT_MS = 60_000;
 function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.ProcessEnv = process.env): number {
   const al = inv.automaticLeave ?? {};
   const noOneJoined = al.noOneJoinedTimeout ?? 600_000;
@@ -202,7 +204,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // caller's capture modes leave video out.
   const videoConfig = recording && (!inv.captureModes || inv.captureModes.includes('video'))
     ? videoCaptureConfigFromEnv(env) : null;
-  const videoSink = videoConfig ? createBotRecordingSink({ inv, mediaType: 'video', log: (m) => console.log(`[bot] ${m}`) }) : undefined;
+  // The video's uploads wait for the audio's first upload, which allocates the session's recording;
+  // two first chunks racing in would split the recording across two storage prefixes. Bounded, so a
+  // bot whose audio never yields a chunk still records video (it is then the only stream).
+  const videoSink = videoConfig && recording ? createBotRecordingSink({
+    inv, mediaType: 'video', log: (m) => console.log(`[bot] ${m}`),
+    startAfter: Promise.race([recording.firstUpload, new Promise<void>((r) => { setTimeout(r, VIDEO_FIRST_UPLOAD_WAIT_MS).unref?.(); })]),
+  }) : undefined;
   // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).

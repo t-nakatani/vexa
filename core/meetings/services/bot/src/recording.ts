@@ -39,6 +39,9 @@ import type { RecordingSink } from './ports.js';
 export interface BotRecordingSink extends RecordingSink {
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
   chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void;
+  /** Settles once this sink's FIRST upload has settled (delivered or given up). A second sink on the
+   *  same session waits on it (`startAfter`) so only one upload allocates the session's recording. */
+  readonly firstUpload: Promise<void>;
 }
 
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
@@ -54,6 +57,11 @@ export interface RecordingSinkOptions {
   uploadChunk?: ChunkUploader;
   /** Which media_files entry of the session's recording the chunks fold into (default 'audio'). */
   mediaType?: 'audio' | 'video';
+  /** Hold every upload until this settles. meeting-api's upload_chunk allocates a new recording id
+   *  when the session has none yet, and two FIRST chunks racing in (audio + video) would land under
+   *  two storage prefixes — the master then misses one stream's header. The video sink therefore
+   *  waits for the audio sink's first upload (bounded by the caller), so the recording exists first. */
+  startAfter?: Promise<unknown>;
   log?: (msg: string) => void;
 }
 
@@ -83,7 +91,11 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   const log = opts.log ?? (() => { /* silent by default */ });
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, opts.mediaType ?? 'audio', log);
 
-  let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
+  // serialize uploads → parts land in seq order; a gated sink starts behind `startAfter`.
+  let queue: Promise<void> = opts.startAfter ? opts.startAfter.then(() => undefined, () => undefined) : Promise.resolve();
+  let resolveFirst!: () => void;
+  const firstUpload = new Promise<void>((r) => { resolveFirst = r; });
+  let firstQueued = false;
   let anyChunk = false;                                // did the tap ever deliver a chunk?
   let finalSent = false;                               // has an is_final chunk been sent? (fallback guard)
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
@@ -94,12 +106,16 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
     if (isFinal) finalSent = true;
     if (seq > maxSeq) maxSeq = seq;
     lastFormat = format;
+    const isFirst = !firstQueued;
+    firstQueued = true;
     queue = queue
       .then(() => upload(seq, isFinal, format, bytes))
-      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); });
+      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); })
+      .finally(() => { if (isFirst) resolveFirst(); });
   };
 
   return {
+    firstUpload,
     chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
