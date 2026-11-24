@@ -160,6 +160,23 @@ async function main(): Promise<void> {
     check('gate: a failed audio first upload still lets the video through', seen.join(',') === 'video:0', seen.join(','));
   }
 
+  {
+    // Teardown releases the gate: an audio-less bot (audio never uploads) still delivers its video.
+    const seen: string[] = [];
+    const neverAudio = createBotRecordingSink({ inv: inv(), uploadChunk: () => {} });
+    const video = createBotRecordingSink({
+      inv: inv(), mediaType: 'video', startAfter: neverAudio.firstUpload, uploadChunk: (seq, isFinal) => { seen.push(`video:${seq}:${isFinal}`); },
+    });
+    video.chunk('k', 0, false, 'webm', new Uint8Array([1]));
+    video.chunk('k', 1, true, 'webm', new Uint8Array([2]));
+    await flush();
+    check('gate: held while the audio has not uploaded', seen.length === 0, seen.join(','));
+    video.release();
+    await video.drain();
+    check('gate: release() + drain() deliver every queued video chunk, final included',
+      seen.join(',') === 'video:0:false,video:1:true', seen.join(','));
+  }
+
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
     interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number }

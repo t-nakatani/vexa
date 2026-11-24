@@ -90,6 +90,8 @@ function meetingChannelId(inv: Invocation): string | number {
 const DEFAULT_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000; // 4 hours
 /** How long video uploads wait for the audio's first upload to allocate the recording (index.ts videoSink). */
 const VIDEO_FIRST_UPLOAD_WAIT_MS = 60_000;
+/** How long teardown waits for the video's queued uploads to be delivered. */
+const VIDEO_DRAIN_TIMEOUT_MS = 30_000;
 function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.ProcessEnv = process.env): number {
   const al = inv.automaticLeave ?? {};
   const noOneJoined = al.noOneJoinedTimeout ?? 600_000;
@@ -322,7 +324,18 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         return async () => {
           await Promise.all([
             stopAudio(),
-            stopVideo?.().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`)),
+            (async () => {
+              if (!stopVideo || !videoSink) return;
+              await stopVideo().catch((e) => console.error(`[bot] video recording stop failed: ${String(e)}`));
+              // The encoder has ended and queued its last chunk. Nothing more will come from the audio
+              // side worth waiting for, so open the gate and deliver what the video queued before exit
+              // (a bot with no audio chunk at all would otherwise lose its whole video at process exit).
+              videoSink.release();
+              await Promise.race([
+                videoSink.drain(),
+                new Promise<void>((r) => { setTimeout(r, VIDEO_DRAIN_TIMEOUT_MS).unref?.(); }),
+              ]);
+            })(),
           ]);
         };
       } : undefined,

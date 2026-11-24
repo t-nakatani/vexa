@@ -42,6 +42,10 @@ export interface BotRecordingSink extends RecordingSink {
   /** Settles once this sink's FIRST upload has settled (delivered or given up). A second sink on the
    *  same session waits on it (`startAfter`) so only one upload allocates the session's recording. */
   readonly firstUpload: Promise<void>;
+  /** Open the `startAfter` gate now (teardown: nothing is left to wait for). Idempotent. */
+  release(): void;
+  /** Settles once every upload queued so far has settled. */
+  drain(): Promise<void>;
 }
 
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
@@ -92,7 +96,11 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, opts.mediaType ?? 'audio', log);
 
   // serialize uploads → parts land in seq order; a gated sink starts behind `startAfter`.
-  let queue: Promise<void> = opts.startAfter ? opts.startAfter.then(() => undefined, () => undefined) : Promise.resolve();
+  let releaseGate!: () => void;
+  const released = new Promise<void>((r) => { releaseGate = r; });
+  let queue: Promise<void> = opts.startAfter
+    ? Promise.race([opts.startAfter.then(() => undefined, () => undefined), released])
+    : Promise.resolve();
   let resolveFirst!: () => void;
   const firstUpload = new Promise<void>((r) => { resolveFirst = r; });
   let firstQueued = false;
@@ -116,6 +124,8 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
 
   return {
     firstUpload,
+    release: () => { releaseGate(); },
+    drain: () => queue,
     chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
